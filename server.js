@@ -100,20 +100,74 @@ async function placeMarketOrder(symbol, side, quantity) {
   return binanceRequest('POST', '/fapi/v1/order', { symbol, side, type: 'MARKET', quantity });
 }
 
-async function placeTPOrder(symbol, side, price) {
-  const stopPrice = Math.round(price * 10) / 10;
-  return binanceRequest('POST', '/fapi/v1/order', { symbol, side, type: 'TAKE_PROFIT_MARKET', stopPrice, closePosition: 'true', timeInForce: 'GTE_GTC' });
+// ── Fixed TP order — uses quantity not closePosition ──
+async function placeTPOrder(symbol, side, quantity, price) {
+  const stopPrice = parseFloat(price.toFixed(1));
+  const result = await binanceRequest('POST', '/fapi/v1/order', {
+    symbol,
+    side,
+    type:        'TAKE_PROFIT_MARKET',
+    stopPrice,
+    quantity,
+    reduceOnly:  'true',
+    workingType: 'MARK_PRICE',
+  });
+  console.log('TP order result:', JSON.stringify(result));
+  return result;
 }
 
-async function placeSLOrder(symbol, side, price) {
-  const stopPrice = Math.round(price * 10) / 10;
-  return binanceRequest('POST', '/fapi/v1/order', { symbol, side, type: 'STOP_MARKET', stopPrice, closePosition: 'true', timeInForce: 'GTE_GTC' });
+// ── Fixed SL order — uses quantity not closePosition ──
+async function placeSLOrder(symbol, side, quantity, price) {
+  const stopPrice = parseFloat(price.toFixed(1));
+  const result = await binanceRequest('POST', '/fapi/v1/order', {
+    symbol,
+    side,
+    type:        'STOP_MARKET',
+    stopPrice,
+    quantity,
+    reduceOnly:  'true',
+    workingType: 'MARK_PRICE',
+  });
+  console.log('SL order result:', JSON.stringify(result));
+  return result;
 }
 
 async function cancelAllOrders(symbol) {
   try { await binanceRequest('DELETE', '/fapi/v1/allOpenOrders', { symbol }); }
   catch (e) { console.log('Cancel orders note:', e.message); }
 }
+
+// ── Poll Binance to check if position still open ──────
+async function checkPositionClosed() {
+  if (!openPos) return;
+  try {
+    const positions = await binanceRequest('GET', '/fapi/v2/positionRisk', { symbol: SYMBOL });
+    const pos = positions.find(p => p.symbol === SYMBOL);
+    if (pos && parseFloat(pos.positionAmt) === 0) {
+      console.log('Position closed by Binance (TP or SL hit)');
+      const exitPrice = await getCurrentPrice(SYMBOL);
+      const pnl = openPos.side === 'BUY'
+        ? (exitPrice - openPos.entry) * parseFloat(QUANTITY)
+        : (openPos.entry - exitPrice) * parseFloat(QUANTITY);
+      trades.unshift({
+        time:   new Date().toISOString(),
+        side:   openPos.side,
+        entry:  openPos.entry,
+        exit:   exitPrice,
+        tp:     openPos.tp,
+        sl:     openPos.sl,
+        pnl:    pnl.toFixed(2),
+        result: exitPrice >= openPos.tp ? 'TP' : 'SL',
+      });
+      openPos = null;
+    }
+  } catch (e) {
+    console.log('Position check error:', e.message);
+  }
+}
+
+// Poll every 30 seconds
+setInterval(checkPositionClosed, 30000);
 
 app.post('/webhook', async (req, res) => {
   const { sentiment } = req.body;
@@ -157,17 +211,19 @@ app.post('/webhook', async (req, res) => {
     const closeSide = side === 'BUY' ? 'SELL' : 'BUY';
 
     const entryOrder = await placeMarketOrder(SYMBOL, side, QUANTITY);
+    console.log('Entry order result:', JSON.stringify(entryOrder));
+
     const rawAvg     = parseFloat(entryOrder.avgPrice || 0);
     const entryPrice = rawAvg > 0 ? rawAvg : currentPrice;
 
     const tp = side === 'BUY' ? entryPrice + atr * TP_ATR_MULT : entryPrice - atr * TP_ATR_MULT;
     const sl = side === 'BUY' ? entryPrice - atr * SL_ATR_MULT : entryPrice + atr * SL_ATR_MULT;
 
-    await placeTPOrder(SYMBOL, closeSide, tp);
-    await placeSLOrder(SYMBOL, closeSide, sl);
+    await placeTPOrder(SYMBOL, closeSide, QUANTITY, tp);
+    await placeSLOrder(SYMBOL, closeSide, QUANTITY, sl);
 
     openPos = { side, entry: entryPrice, tp, sl, atr, qty: QUANTITY, openedAt: new Date().toISOString() };
-    console.log(`[${new Date().toISOString()}] ENTRY ${side} @ ${entryPrice.toFixed(1)} | TP: ${tp.toFixed(1)} | SL: ${sl.toFixed(1)} | ATR: ${atr.toFixed(1)}`);
+    console.log(`ENTRY ${side} @ ${entryPrice.toFixed(1)} | TP: ${tp.toFixed(1)} | SL: ${sl.toFixed(1)} | ATR: ${atr.toFixed(1)}`);
 
     res.json({ ok: true, side, entry: entryPrice.toFixed(1), tp: tp.toFixed(1), sl: sl.toFixed(1), atr: atr.toFixed(1), rr: `${TP_ATR_MULT/SL_ATR_MULT}:1` });
 
