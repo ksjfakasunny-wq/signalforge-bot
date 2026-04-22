@@ -1,0 +1,15 @@
+{
+  "name": "signalforge-bot",
+  "version": "1.0.0",
+  "description": "ATR14 Binance Futures Bot — receives TradingView webhooks and places orders directly on Binance",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "express": "^4.18.2"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
