@@ -135,8 +135,8 @@ function stopSLMonitor() {
 setInterval(async () => {
   if (!openPos) return;
   try {
-    const positions = await binanceRequest('GET', '/positionRisk', { symbol: SYMBOL });
-    const pos  = positions.find(p => p.symbol === SYMBOL);
+    const data = await binanceRequest('GET', '/positionRisk', { symbol: SYMBOL });
+    const pos  = extractPosition(data, SYMBOL);
     const size = pos ? Math.abs(parseFloat(pos.positionAmt)) : 0;
     if (size === 0) {
       const pnl = openPos.side === 'BUY'
@@ -151,11 +151,18 @@ setInterval(async () => {
   } catch (e) { console.log('TP poll error:', e.message); }
 }, 30000);
 
+// ── Helper: extract position from positionRisk response (array or object) ────
+function extractPosition(data, symbol) {
+  if (Array.isArray(data)) return data.find(p => p.symbol === symbol) || null;
+  if (data && data.symbol === symbol) return data;
+  return null;
+}
+
 // ── Startup position check ───────────────────────────────────────────────────
 async function checkExistingPosition() {
   try {
-    const positions = await binanceRequest('GET', '/positionRisk', { symbol: SYMBOL });
-    const pos  = positions.find(p => p.symbol === SYMBOL);
+    const data = await binanceRequest('GET', '/positionRisk', { symbol: SYMBOL });
+    const pos  = extractPosition(data, SYMBOL);
     const size = pos ? parseFloat(pos.positionAmt) : 0;
     if (Math.abs(size) > 0) {
       const side  = size > 0 ? 'BUY' : 'SELL';
