@@ -139,6 +139,8 @@ setInterval(async () => {
     const pos  = extractPosition(data, SYMBOL);
     const size = pos ? Math.abs(parseFloat(pos.positionAmt)) : 0;
     if (size === 0) {
+      // FIX 1: Cancel any orphaned TP orders left on Binance
+      await cancelAllOrders(SYMBOL);
       const pnl = openPos.side === 'BUY'
         ? (openPos.tp - openPos.entry) * parseFloat(openPos.qty) * LEVERAGE
         : (openPos.entry - openPos.tp) * parseFloat(openPos.qty) * LEVERAGE;
@@ -158,8 +160,8 @@ function extractPosition(data, symbol) {
   return null;
 }
 
-// ── Startup position check ───────────────────────────────────────────────────
-async function checkExistingPosition() {
+// ── Startup position check (retries 3x with delay) ──────────────────────────
+async function checkExistingPosition(attempt = 1) {
   try {
     const data = await binanceRequest('GET', '/positionRisk', { symbol: SYMBOL });
     const pos  = extractPosition(data, SYMBOL);
@@ -174,9 +176,20 @@ async function checkExistingPosition() {
       startSLMonitor();
       console.log(`⚠️  Position restored: ${side} @ ${entry} | TP: ${tp.toFixed(1)} | SL: ${sl.toFixed(1)}`);
     } else {
+      // FIX 2: No position — cancel any orphaned open orders left from previous session
+      await cancelAllOrders(SYMBOL);
       console.log('✅ No existing position — starting fresh');
     }
-  } catch (e) { console.log('Startup check error:', e.message); }
+  } catch (e) {
+    console.log(`Startup check error (attempt ${attempt}):`, e.message);
+    // FIX 2: Retry up to 3 times with 5s delay
+    if (attempt < 3) {
+      console.log(`Retrying in 5s...`);
+      setTimeout(() => checkExistingPosition(attempt + 1), 5000);
+    } else {
+      console.log('Startup check failed after 3 attempts — starting fresh');
+    }
+  }
 }
 
 // ── Webhook ──────────────────────────────────────────────────────────────────
