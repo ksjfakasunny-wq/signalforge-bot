@@ -243,12 +243,23 @@ app.post('/webhook', async (req, res) => {
       const tp = side === 'BUY' ? entryPrice + atr * TP_ATR_MULT : entryPrice - atr * TP_ATR_MULT;
       const sl = side === 'BUY' ? entryPrice - atr * SL_ATR_MULT : entryPrice + atr * SL_ATR_MULT;
 
-      // FIX: if TP placement fails, log clearly and still protect with SL monitor
-      try {
-        await placeTPOrder(SYMBOL, closeSide, QUANTITY, tp);
-      } catch (tpErr) {
-        console.error('⚠️  TP order failed — SL monitor still active:', tpErr.message);
+      // FIX: wait 2s for Binance to register position before placing TP
+      // Prevents -2022 ReduceOnly rejected error
+      await new Promise(r => setTimeout(r, 2000));
+
+      // FIX: retry TP up to 3 times
+      let tpPlaced = false;
+      for (let attempt = 1; attempt <= 3; attempt++) {
+        try {
+          await placeTPOrder(SYMBOL, closeSide, QUANTITY, tp);
+          tpPlaced = true;
+          break;
+        } catch (tpErr) {
+          console.error(`⚠️  TP attempt ${attempt} failed: ${tpErr.message}`);
+          if (attempt < 3) await new Promise(r => setTimeout(r, 1000));
+        }
       }
+      if (!tpPlaced) console.error('⚠️  TP failed all 3 attempts — SL monitor protecting');
 
       openPos = { side, entry: entryPrice, tp, sl, atr, qty: QUANTITY, openedAt: new Date().toISOString() };
       startSLMonitor();
