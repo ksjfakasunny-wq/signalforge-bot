@@ -18,10 +18,10 @@ const SECRET_KEY = process.env.BINANCE_SECRET_KEY || '';
 const TESTNET    = process.env.BINANCE_TESTNET === 'true';
 const BASE_URL   = TESTNET ? 'testnet.binancefuture.com' : 'fapi.binance.com';
 const SYMBOL     = process.env.SYMBOL      || 'BTCUSDT';
-const QUANTITY   = process.env.QUANTITY    || '0.001';
+const QUANTITY   = process.env.QUANTITY    || '0.05';
 const TP_ATR_MULT= parseFloat(process.env.TP_ATR_MULT || '3.0');
 const SL_ATR_MULT= parseFloat(process.env.SL_ATR_MULT || '0.5');
-const LEVERAGE   = parseInt(process.env.LEVERAGE   || '1');
+const LEVERAGE   = parseInt(process.env.LEVERAGE   || '10');
 
 let trades  = [];
 let openPos = null;
@@ -116,7 +116,6 @@ async function placeTPOrder(symbol, side, quantity, price) {
 
 async function placeSLOrder(symbol, side, quantity, price) {
   const stopPrice  = parseFloat(price.toFixed(1));
-  // STOP order needs a limit price slightly beyond the stop
   const limitPrice = side === 'SELL'
     ? parseFloat((price * 0.998).toFixed(1))
     : parseFloat((price * 1.002).toFixed(1));
@@ -240,13 +239,17 @@ app.post('/webhook', async (req, res) => {
     const tp = side === 'BUY' ? entryPrice + atr * TP_ATR_MULT : entryPrice - atr * TP_ATR_MULT;
     const sl = side === 'BUY' ? entryPrice - atr * SL_ATR_MULT : entryPrice + atr * SL_ATR_MULT;
 
+    // Calculate dollar values for logging
+    const tpDollar = (atr * TP_ATR_MULT * parseFloat(QUANTITY)).toFixed(2);
+    const slDollar = (atr * SL_ATR_MULT * parseFloat(QUANTITY)).toFixed(2);
+
     await placeTPOrder(SYMBOL, closeSide, QUANTITY, tp);
     await placeSLOrder(SYMBOL, closeSide, QUANTITY, sl);
 
     openPos = { side, entry: entryPrice, tp, sl, atr, qty: QUANTITY, openedAt: new Date().toISOString() };
-    console.log(`ENTRY ${side} @ ${entryPrice.toFixed(1)} | TP: ${tp.toFixed(1)} | SL: ${sl.toFixed(1)} | ATR: ${atr.toFixed(1)}`);
+    console.log(`ENTRY ${side} @ ${entryPrice.toFixed(1)} | TP: ${tp.toFixed(1)} (+$${tpDollar}) | SL: ${sl.toFixed(1)} (-$${slDollar}) | ATR: ${atr.toFixed(1)} | Leverage: ${LEVERAGE}x`);
 
-    res.json({ ok: true, side, entry: entryPrice.toFixed(1), tp: tp.toFixed(1), sl: sl.toFixed(1), atr: atr.toFixed(1), rr: `${TP_ATR_MULT/SL_ATR_MULT}:1` });
+    res.json({ ok: true, side, entry: entryPrice.toFixed(1), tp: tp.toFixed(1), sl: sl.toFixed(1), tpDollar, slDollar, atr: atr.toFixed(1), rr: `${TP_ATR_MULT/SL_ATR_MULT}:1`, leverage: LEVERAGE });
 
   } catch (e) {
     console.error('Trade error:', e.message);
@@ -255,7 +258,13 @@ app.post('/webhook', async (req, res) => {
 });
 
 app.get('/status', (req, res) => {
-  res.json({ ok: true, testnet: TESTNET, symbol: SYMBOL, quantity: QUANTITY, leverage: LEVERAGE, tpMult: TP_ATR_MULT, slMult: SL_ATR_MULT, rr: `${TP_ATR_MULT/SL_ATR_MULT}:1`, openPos, recentTrades: trades.slice(0, 20) });
+  res.json({
+    ok: true, testnet: TESTNET, symbol: SYMBOL,
+    quantity: QUANTITY, leverage: LEVERAGE,
+    tpMult: TP_ATR_MULT, slMult: SL_ATR_MULT,
+    rr: `${TP_ATR_MULT/SL_ATR_MULT}:1`,
+    openPos, recentTrades: trades.slice(0, 20)
+  });
 });
 
 app.get('/health', (req, res) => {
@@ -264,7 +273,14 @@ app.get('/health', (req, res) => {
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, async () => {
-  console.log(`ATR14 Binance Futures Bot | Mode: ${TESTNET ? 'TESTNET' : 'LIVE'} | Symbol: ${SYMBOL} | Port: ${PORT}`);
+  console.log(`╔══════════════════════════════════════════╗`);
+  console.log(`║  ATR14 Futures Bot                       ║`);
+  console.log(`║  Mode:     ${TESTNET ? 'TESTNET ✓' : 'LIVE ⚠️ '}                      ║`);
+  console.log(`║  Symbol:   ${SYMBOL.padEnd(10)}                ║`);
+  console.log(`║  Quantity: ${QUANTITY.padEnd(10)}                ║`);
+  console.log(`║  Leverage: ${String(LEVERAGE).padEnd(10)}x               ║`);
+  console.log(`║  TP: ${TP_ATR_MULT}× ATR  SL: ${SL_ATR_MULT}× ATR  RR: ${TP_ATR_MULT/SL_ATR_MULT}:1  ║`);
+  console.log(`╚══════════════════════════════════════════╝`);
   await checkExistingPosition();
 });
 
