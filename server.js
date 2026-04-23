@@ -100,12 +100,10 @@ async function placeMarketOrder(symbol, side, quantity) {
   return binanceRequest('POST', '/fapi/v1/order', { symbol, side, type: 'MARKET', quantity });
 }
 
-// ── TP using LIMIT order (reduceOnly) ─────────────────
 async function placeTPOrder(symbol, side, quantity, price) {
   const limitPrice = parseFloat(price.toFixed(1));
   const result = await binanceRequest('POST', '/fapi/v1/order', {
-    symbol,
-    side,
+    symbol, side,
     type:       'LIMIT',
     price:      limitPrice,
     quantity,
@@ -116,12 +114,10 @@ async function placeTPOrder(symbol, side, quantity, price) {
   return result;
 }
 
-// ── SL using STOP_MARKET with workingType CONTRACT_PRICE
 async function placeSLOrder(symbol, side, quantity, price) {
   const stopPrice = parseFloat(price.toFixed(1));
   const result = await binanceRequest('POST', '/fapi/v1/order', {
-    symbol,
-    side,
+    symbol, side,
     type:        'STOP_MARKET',
     stopPrice,
     quantity,
@@ -137,6 +133,30 @@ async function cancelAllOrders(symbol) {
   catch (e) { console.log('Cancel orders note:', e.message); }
 }
 
+// ── Startup check — restore position state from Binance ──
+async function checkExistingPosition() {
+  try {
+    const positions = await binanceRequest('GET', '/fapi/v2/positionRisk', { symbol: SYMBOL });
+    const pos = positions.find(p => p.symbol === SYMBOL);
+    if (pos && Math.abs(parseFloat(pos.positionAmt)) > 0) {
+      const amt       = parseFloat(pos.positionAmt);
+      const side      = amt > 0 ? 'BUY' : 'SELL';
+      const entryPrice= parseFloat(pos.entryPrice);
+      const atr       = await getATR(SYMBOL, '3m', 14);
+      const tp = side === 'BUY' ? entryPrice + atr * TP_ATR_MULT : entryPrice - atr * TP_ATR_MULT;
+      const sl = side === 'BUY' ? entryPrice - atr * SL_ATR_MULT : entryPrice + atr * SL_ATR_MULT;
+      openPos = { side, entry: entryPrice, tp, sl, atr, qty: QUANTITY, openedAt: new Date().toISOString(), restored: true };
+      console.log(`⚠️  Existing position detected on startup — restored: ${side} @ ${entryPrice}`);
+      console.log(`   TP: ${tp.toFixed(1)} | SL: ${sl.toFixed(1)}`);
+    } else {
+      console.log('✅ No existing position on Binance — starting fresh');
+    }
+  } catch (e) {
+    console.log('Startup position check error:', e.message);
+  }
+}
+
+// ── Poll every 30s to detect TP/SL hits ──────────────
 async function checkPositionClosed() {
   if (!openPos) return;
   try {
@@ -156,8 +176,9 @@ async function checkPositionClosed() {
         tp:     openPos.tp,
         sl:     openPos.sl,
         pnl:    pnl.toFixed(2),
-        result: pnl > 0 ? 'TP WIN' : 'SL LOSS',
+        result: pnl > 0 ? 'TP WIN ✅' : 'SL LOSS ❌',
       });
+      console.log(`Trade closed — Result: ${pnl > 0 ? 'WIN' : 'LOSS'} | PNL: ${pnl.toFixed(4)} USDT`);
       openPos = null;
     }
   } catch (e) {
@@ -167,6 +188,7 @@ async function checkPositionClosed() {
 
 setInterval(checkPositionClosed, 30000);
 
+// ── Webhook ───────────────────────────────────────────
 app.post('/webhook', async (req, res) => {
   const { sentiment } = req.body;
   console.log(`[${new Date().toISOString()}] Webhook:`, req.body);
@@ -190,7 +212,7 @@ app.post('/webhook', async (req, res) => {
   }
 
   if (openPos) {
-    console.log('Already in position — ignoring');
+    console.log('Already in position — ignoring signal');
     return res.json({ ok: true, message: 'Already in position — ignored' });
   }
 
@@ -209,7 +231,7 @@ app.post('/webhook', async (req, res) => {
     const closeSide = side === 'BUY' ? 'SELL' : 'BUY';
 
     const entryOrder = await placeMarketOrder(SYMBOL, side, QUANTITY);
-    console.log('Entry order result:', JSON.stringify(entryOrder));
+    console.log('Entry order:', JSON.stringify(entryOrder));
 
     const rawAvg     = parseFloat(entryOrder.avgPrice || 0);
     const entryPrice = rawAvg > 0 ? rawAvg : currentPrice;
@@ -240,6 +262,9 @@ app.get('/health', (req, res) => {
 });
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => {
+app.listen(PORT, async () => {
   console.log(`ATR14 Binance Futures Bot | Mode: ${TESTNET ? 'TESTNET' : 'LIVE'} | Symbol: ${SYMBOL} | Port: ${PORT}`);
+  // Check for existing position on startup
+  await checkExistingPosition();
 });
+
