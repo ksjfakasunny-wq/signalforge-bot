@@ -100,23 +100,23 @@ async function placeMarketOrder(symbol, side, quantity) {
   return binanceRequest('POST', '/fapi/v1/order', { symbol, side, type: 'MARKET', quantity });
 }
 
-// ── Fixed TP order — uses quantity not closePosition ──
+// ── TP using LIMIT order (reduceOnly) ─────────────────
 async function placeTPOrder(symbol, side, quantity, price) {
-  const stopPrice = parseFloat(price.toFixed(1));
+  const limitPrice = parseFloat(price.toFixed(1));
   const result = await binanceRequest('POST', '/fapi/v1/order', {
     symbol,
     side,
-    type:        'TAKE_PROFIT_MARKET',
-    stopPrice,
+    type:       'LIMIT',
+    price:      limitPrice,
     quantity,
-    reduceOnly:  'true',
-    workingType: 'MARK_PRICE',
+    reduceOnly: 'true',
+    timeInForce:'GTC',
   });
   console.log('TP order result:', JSON.stringify(result));
   return result;
 }
 
-// ── Fixed SL order — uses quantity not closePosition ──
+// ── SL using STOP_MARKET with workingType CONTRACT_PRICE
 async function placeSLOrder(symbol, side, quantity, price) {
   const stopPrice = parseFloat(price.toFixed(1));
   const result = await binanceRequest('POST', '/fapi/v1/order', {
@@ -126,7 +126,7 @@ async function placeSLOrder(symbol, side, quantity, price) {
     stopPrice,
     quantity,
     reduceOnly:  'true',
-    workingType: 'MARK_PRICE',
+    workingType: 'CONTRACT_PRICE',
   });
   console.log('SL order result:', JSON.stringify(result));
   return result;
@@ -137,7 +137,6 @@ async function cancelAllOrders(symbol) {
   catch (e) { console.log('Cancel orders note:', e.message); }
 }
 
-// ── Poll Binance to check if position still open ──────
 async function checkPositionClosed() {
   if (!openPos) return;
   try {
@@ -157,7 +156,7 @@ async function checkPositionClosed() {
         tp:     openPos.tp,
         sl:     openPos.sl,
         pnl:    pnl.toFixed(2),
-        result: exitPrice >= openPos.tp ? 'TP' : 'SL',
+        result: pnl > 0 ? 'TP WIN' : 'SL LOSS',
       });
       openPos = null;
     }
@@ -166,7 +165,6 @@ async function checkPositionClosed() {
   }
 }
 
-// Poll every 30 seconds
 setInterval(checkPositionClosed, 30000);
 
 app.post('/webhook', async (req, res) => {
