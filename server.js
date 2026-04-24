@@ -95,9 +95,12 @@ async function getMarkPrice() {
 
 // ── Get ATR14 from 3m klines ──────────────────────────────────────────────────
 async function getATR() {
-  const to   = Date.now();
-  const from = to - (30 * 3 * 60 * 1000); // 30 x 3min candles
-  const data = await kucoinPublic(`/api/v1/klines?symbol=${SYMBOL}&granularity=3&from=${from}&to=${to}`);
+  const to   = Math.floor(Date.now() / 1000);
+  const from = to - (30 * 3 * 60); // 30 x 3min candles in seconds
+  const raw  = await kucoinPublic(`/api/v1/klines?symbol=${SYMBOL}&granularity=3&from=${from}&to=${to}`);
+  // KuCoin returns { data: [...] } or array directly — normalise
+  const data = Array.isArray(raw) ? raw : (Array.isArray(raw.data) ? raw.data : Object.values(raw));
+  if (!data || data.length === 0) throw new Error('No kline data returned');
   // KuCoin kline format: [time, open, high, low, close, volume]
   const trs = data.map((k, i) => {
     const h = parseFloat(k[2]), l = parseFloat(k[3]);
@@ -367,3 +370,4 @@ app.listen(PORT, async () => {
   console.log(`╚══════════════════════════════════════════════╝`);
   await checkExistingPosition();
 });
+
