@@ -159,32 +159,21 @@ function stopSLMonitor() {
   if (slMonitorInterval) { clearInterval(slMonitorInterval); slMonitorInterval = null; }
 }
 
-// ── Wait for Binance to confirm position registered, then start TP poll ─────
-// This replaces the blanket 60s delay — works even if TP hits in <60 seconds
-async function waitForPositionConfirmed(maxWaitMs = 15000) {
-  const start = Date.now();
-  while (Date.now() - start < maxWaitMs) {
-    try {
-      const data = await binanceRequest('GET', '/positionRisk', { symbol: SYMBOL });
-      const pos  = extractPosition(data, SYMBOL);
-      const size = pos ? Math.abs(parseFloat(pos.positionAmt)) : 0;
-      if (size > 0) {
-        console.log(`✅ Position confirmed on Binance (${((Date.now()-start)/1000).toFixed(1)}s)`);
-        return true;
-      }
-    } catch (e) { console.log('Position confirm check error:', e.message); }
-    await new Promise(r => setTimeout(r, 2000)); // check every 2s
-  }
-  console.log('⚠️  Position not confirmed after 15s — proceeding anyway');
-  return false;
+// ── Query order status by orderId ───────────────────────────────────────────
+async function getOrderStatus(symbol, orderId) {
+  return binanceRequest('GET', '/order', { symbol, orderId });
 }
 
-// ── TP Poll (every 10s, only runs after position confirmed) ──────────────────
+// ── TP Poll — checks TP ORDER status, not positionRisk ──────────────────────
+// This is the correct method: if the TP limit order is FILLED = real win
+// positionRisk can return 0 briefly and cause false positives — order status cannot
 let tpPollActive = false;
 
-function startTPPoll() {
+function startTPPoll(tpOrderId) {
   if (tpPollActive) return;
   tpPollActive = true;
+  console.log(`🎯 TP poll started — watching order ${tpOrderId}`);
+
   const interval = setInterval(async () => {
     if (!openPos || isClosing) {
       clearInterval(interval);
@@ -192,20 +181,61 @@ function startTPPoll() {
       return;
     }
     try {
-      const data = await binanceRequest('GET', '/positionRisk', { symbol: SYMBOL });
-      const pos  = extractPosition(data, SYMBOL);
-      const size = pos ? Math.abs(parseFloat(pos.positionAmt)) : 0;
-      if (size === 0) {
-        const { tp, entry, qty, side } = openPos;
+      // If no TP order on Binance (was rejected), fall back to positionRisk
+      if (!tpOrderId) {
+        const data = await binanceRequest('GET', '/positionRisk', { symbol: SYMBOL });
+        const pos  = extractPosition(data, SYMBOL);
+        const size = pos ? Math.abs(parseFloat(pos.positionAmt)) : 0;
+        if (size === 0) {
+          const { tp, entry, qty, side } = openPos;
+          const pnl = side === 'BUY'
+            ? (tp - entry) * parseFloat(qty) * LEVERAGE
+            : (entry - tp) * parseFloat(qty) * LEVERAGE;
+          clearInterval(interval);
+          tpPollActive = false;
+          await closePosition('TP', pnl);
+        }
+        return;
+      }
+
+      // Primary method: check if TP limit order was FILLED
+      const order = await getOrderStatus(SYMBOL, tpOrderId);
+      if (order.status === 'FILLED') {
+        const fillPrice = parseFloat(order.avgPrice);
+        const { entry, qty, side } = openPos;
         const pnl = side === 'BUY'
-          ? (tp - entry) * parseFloat(qty) * LEVERAGE
-          : (entry - tp) * parseFloat(qty) * LEVERAGE;
+          ? (fillPrice - entry) * parseFloat(qty) * LEVERAGE
+          : (entry - fillPrice) * parseFloat(qty) * LEVERAGE;
         clearInterval(interval);
         tpPollActive = false;
+        console.log(`✅ TP order FILLED @ ${fillPrice}`);
         await closePosition('TP', pnl);
+      } else if (order.status === 'CANCELED' || order.status === 'EXPIRED') {
+        // TP was cancelled (SL hit or manual) — stop polling
+        clearInterval(interval);
+        tpPollActive = false;
+        console.log(`TP order ${order.status} — stopping TP poll`);
       }
     } catch (e) { console.log('TP poll error:', e.message); }
   }, 10000);
+}
+
+// ── Confirm entry filled, return actual fill price ───────────────────────────
+async function confirmEntryFilled(orderId, fallbackPrice, maxWaitMs = 10000) {
+  const start = Date.now();
+  while (Date.now() - start < maxWaitMs) {
+    try {
+      const order = await getOrderStatus(SYMBOL, orderId);
+      if (order.status === 'FILLED' && parseFloat(order.avgPrice) > 0) {
+        const fillPrice = parseFloat(order.avgPrice);
+        console.log(`✅ Entry confirmed FILLED @ ${fillPrice}`);
+        return fillPrice;
+      }
+    } catch (e) { console.log('Entry confirm error:', e.message); }
+    await new Promise(r => setTimeout(r, 1000));
+  }
+  console.log(`⚠️  Entry not confirmed after ${maxWaitMs/1000}s — using mark price ${fallbackPrice}`);
+  return fallbackPrice;
 }
 
 // ── Keep-alive self-ping to prevent Render free tier sleep ───────────────────
@@ -229,7 +259,7 @@ async function checkExistingPosition(attempt = 1) {
       const sl    = side === 'BUY' ? entry - atr * SL_ATR_MULT : entry + atr * SL_ATR_MULT;
       openPos = { side, entry, tp, sl, atr, qty: QUANTITY, openedAt: new Date().toISOString() };
       startSLMonitor();
-      startTPPoll();
+      startTPPoll(null); // no TP orderId on restore — falls back to positionRisk
       console.log(`⚠️  Position restored: ${side} @ ${entry} | TP: ${tp.toFixed(1)} | SL: ${sl.toFixed(1)}`);
     } else {
       await cancelAllOrders(SYMBOL); // clean up any orphaned orders
@@ -267,39 +297,35 @@ app.post('/webhook', async (req, res) => {
 
       const currentPrice = await getMarkPrice(SYMBOL);
       const atr          = await getATR(SYMBOL);
-      const entryOrder   = await placeMarketOrder(SYMBOL, side, QUANTITY);
+      const entryOrder = await placeMarketOrder(SYMBOL, side, QUANTITY);
       console.log('Entry order:', JSON.stringify(entryOrder));
 
-      const rawAvg     = parseFloat(entryOrder.avgPrice || 0);
-      const entryPrice = rawAvg > 0 ? rawAvg : currentPrice;
+      // Confirm entry filled and get real fill price (polls order status)
+      const entryPrice = await confirmEntryFilled(entryOrder.orderId, currentPrice);
 
       const tp = side === 'BUY' ? entryPrice + atr * TP_ATR_MULT : entryPrice - atr * TP_ATR_MULT;
       const sl = side === 'BUY' ? entryPrice - atr * SL_ATR_MULT : entryPrice + atr * SL_ATR_MULT;
 
-      // FIX: wait 2s for Binance to register position before placing TP
-      // Prevents -2022 ReduceOnly rejected error
+      // Wait 2s then place TP — gives Binance time to register position
       await new Promise(r => setTimeout(r, 2000));
 
-      // FIX: retry TP up to 3 times
-      let tpPlaced = false;
+      // Place TP and store its orderId for reliable status checking
+      let tpOrderId = null;
       for (let attempt = 1; attempt <= 3; attempt++) {
         try {
-          await placeTPOrder(SYMBOL, closeSide, QUANTITY, tp);
-          tpPlaced = true;
+          const tpOrder = await placeTPOrder(SYMBOL, closeSide, QUANTITY, tp);
+          tpOrderId = tpOrder.orderId;
           break;
         } catch (tpErr) {
           console.error(`⚠️  TP attempt ${attempt} failed: ${tpErr.message}`);
           if (attempt < 3) await new Promise(r => setTimeout(r, 1000));
         }
       }
-      if (!tpPlaced) console.error('⚠️  TP failed all 3 attempts — SL monitor protecting');
+      if (!tpOrderId) console.error('⚠️  TP failed all 3 attempts — SL monitor protecting');
 
       openPos = { side, entry: entryPrice, tp, sl, atr, qty: QUANTITY, openedAt: new Date().toISOString() };
       startSLMonitor();
-
-      // FIX: Wait for Binance to confirm position, THEN start TP poll
-      // This prevents false TP detections without missing fast TP hits
-      waitForPositionConfirmed().then(() => startTPPoll());
+      startTPPoll(tpOrderId);
 
       const tpDollar = (atr * TP_ATR_MULT * parseFloat(QUANTITY) * LEVERAGE).toFixed(2);
       const slDollar = (atr * SL_ATR_MULT * parseFloat(QUANTITY) * LEVERAGE).toFixed(2);
@@ -371,3 +397,4 @@ app.listen(PORT, async () => {
   console.log(`╚══════════════════════════════════════════════╝`);
   await checkExistingPosition();
 });
+
