@@ -394,3 +394,4 @@ app.listen(PORT, async () => {
   console.log(`╚══════════════════════════════════════════════╝`);
   await checkExistingPosition();
 });
+
