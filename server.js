@@ -141,9 +141,18 @@ function startSLMonitor() {
     if (!openPos || isClosing) return;
     try {
       const mark = await getMarkPrice(SYMBOL);
-      const { side, sl, entry, qty } = openPos;
+      const { side, sl, tp, entry, qty } = openPos;
+
+      const tpHit = side === 'BUY' ? mark >= tp : mark <= tp;
       const slHit = side === 'BUY' ? mark <= sl : mark >= sl;
-      if (slHit) {
+
+      if (tpHit) {
+        console.log(`🎯 TP HIT @ ${mark.toFixed(1)} | level: ${tp.toFixed(1)}`);
+        const pnl = side === 'BUY'
+          ? (tp - entry) * parseFloat(qty) * LEVERAGE
+          : (entry - tp) * parseFloat(qty) * LEVERAGE;
+        await closePosition('TP', pnl);
+      } else if (slHit) {
         console.log(`⛔ SL HIT @ ${mark.toFixed(1)} | level: ${sl.toFixed(1)}`);
         const pnl = side === 'BUY'
           ? (sl - entry) * parseFloat(qty) * LEVERAGE
@@ -152,7 +161,7 @@ function startSLMonitor() {
       }
     } catch (e) { console.log('SL monitor error:', e.message); }
   }, 5000);
-  console.log('🔍 SL monitor active (every 5s)');
+  console.log('🔍 Price monitor active — watching TP and SL every 5s');
 }
 
 function stopSLMonitor() {
@@ -306,22 +315,10 @@ app.post('/webhook', async (req, res) => {
       const tp = side === 'BUY' ? entryPrice + atr * TP_ATR_MULT : entryPrice - atr * TP_ATR_MULT;
       const sl = side === 'BUY' ? entryPrice - atr * SL_ATR_MULT : entryPrice + atr * SL_ATR_MULT;
 
-      // Wait 2s then place TP — gives Binance time to register position
-      await new Promise(r => setTimeout(r, 2000));
-
-      // Place TP and store its orderId for reliable status checking
+      // DEMO MODE: Skip Binance TP order entirely
+      // Monitor both TP and SL via mark price — avoids all -2022 errors
       let tpOrderId = null;
-      for (let attempt = 1; attempt <= 3; attempt++) {
-        try {
-          const tpOrder = await placeTPOrder(SYMBOL, closeSide, QUANTITY, tp);
-          tpOrderId = tpOrder.orderId;
-          break;
-        } catch (tpErr) {
-          console.error(`⚠️  TP attempt ${attempt} failed: ${tpErr.message}`);
-          if (attempt < 3) await new Promise(r => setTimeout(r, 1000));
-        }
-      }
-      if (!tpOrderId) console.error('⚠️  TP failed all 3 attempts — SL monitor protecting');
+      console.log('📊 Demo mode — TP and SL both monitored by bot (no Binance TP order)');
 
       openPos = { side, entry: entryPrice, tp, sl, atr, qty: QUANTITY, openedAt: new Date().toISOString() };
       startSLMonitor();
@@ -397,4 +394,3 @@ app.listen(PORT, async () => {
   console.log(`╚══════════════════════════════════════════════╝`);
   await checkExistingPosition();
 });
-
