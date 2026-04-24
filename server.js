@@ -6,72 +6,102 @@ const app = express();
 app.use(express.json());
 
 // ── Config ───────────────────────────────────────────────────────────────────
-const API_KEY     = process.env.BINANCE_API_KEY    || '';
-const API_SECRET  = process.env.BINANCE_SECRET_KEY || '';
-const TESTNET     = process.env.BINANCE_TESTNET === 'true';
-const SYMBOL      = process.env.SYMBOL      || 'BTCUSDT';
-const QUANTITY    = process.env.QUANTITY    || '0.05';
-const LEVERAGE    = parseInt(process.env.LEVERAGE    || '10');
+const API_KEY     = process.env.KUCOIN_API_KEY    || '';
+const API_SECRET  = process.env.KUCOIN_SECRET_KEY || '';
+const API_PASS    = process.env.KUCOIN_PASSPHRASE || '';
+const SYMBOL      = process.env.SYMBOL      || 'XBTUSDTM'; // BTC/USDT perpetual
+const LOTS        = parseInt(process.env.LOTS || '3');      // 1 lot = 0.001 BTC
+const LEVERAGE    = process.env.LEVERAGE    || '3';
 const TP_ATR_MULT = parseFloat(process.env.TP_ATR_MULT || '3.0');
 const SL_ATR_MULT = parseFloat(process.env.SL_ATR_MULT || '0.5');
 
-const BASE_URL = TESTNET ? 'testnet.binancefuture.com' : 'fapi.binance.com';
+const BASE_URL = 'api-futures.kucoin.com';
+const PORT = process.env.PORT || 3000;
 
-// ── State ────────────────────────────────────────────────────────────────────
+// ── State ─────────────────────────────────────────────────────────────────────
 let openPos           = null;
 let trades            = [];
 let slMonitorInterval = null;
-let isClosing         = false;   // FIX: race condition guard
-let isEntering        = false;   // FIX: double webhook guard
+let isClosing         = false;
+let isEntering        = false;
 
-// ── Binance signed request ───────────────────────────────────────────────────
-function binanceRequest(method, path, params = {}) {
+// ── KuCoin signed request ─────────────────────────────────────────────────────
+function kucoinRequest(method, path, body = null) {
   return new Promise((resolve, reject) => {
-    const ts        = Date.now();
-    const query     = Object.entries({ ...params, timestamp: ts })
-      .map(([k, v]) => `${k}=${encodeURIComponent(v)}`).join('&');
-    const signature = crypto.createHmac('sha256', API_SECRET).update(query).digest('hex');
-    const fullPath  = `/fapi/v1${path}?${query}&signature=${signature}`;
-    const options   = {
-      hostname: BASE_URL, path: fullPath, method,
-      headers: { 'X-MBX-APIKEY': API_KEY, 'Content-Type': 'application/json' },
+    const ts        = Date.now().toString();
+    const bodyStr   = body ? JSON.stringify(body) : '';
+    const signStr   = ts + method.toUpperCase() + path + bodyStr;
+    const sign      = crypto.createHmac('sha256', API_SECRET).update(signStr).digest('base64');
+    const passHmac  = crypto.createHmac('sha256', API_SECRET).update(API_PASS).digest('base64');
+
+    const options = {
+      hostname: BASE_URL,
+      path,
+      method: method.toUpperCase(),
+      headers: {
+        'Content-Type':       'application/json',
+        'KC-API-KEY':         API_KEY,
+        'KC-API-SIGN':        sign,
+        'KC-API-TIMESTAMP':   ts,
+        'KC-API-PASSPHRASE':  passHmac,
+        'KC-API-KEY-VERSION': '2',
+      },
     };
+
     const req = https.request(options, res => {
       let data = '';
       res.on('data', c => data += c);
-      res.on('end', () => { try { resolve(JSON.parse(data)); } catch { reject(new Error('Parse: ' + data)); } });
+      res.on('end', () => {
+        try {
+          const parsed = JSON.parse(data);
+          if (parsed.code && parsed.code !== '200000') {
+            reject(new Error(`KuCoin error ${parsed.code}: ${parsed.msg}`));
+          } else {
+            resolve(parsed.data !== undefined ? parsed.data : parsed);
+          }
+        } catch { reject(new Error('Parse error: ' + data)); }
+      });
     });
     req.on('error', reject);
+    if (bodyStr) req.write(bodyStr);
     req.end();
   });
 }
 
-// ── Binance public request ───────────────────────────────────────────────────
-function binancePublic(path, params = {}) {
+// ── KuCoin public request ─────────────────────────────────────────────────────
+function kucoinPublic(path) {
   return new Promise((resolve, reject) => {
-    const query    = Object.entries(params).map(([k, v]) => `${k}=${v}`).join('&');
-    const fullPath = `/fapi/v1${path}${query ? '?' + query : ''}`;
-    const options  = { hostname: BASE_URL, path: fullPath, method: 'GET' };
+    const options = { hostname: BASE_URL, path, method: 'GET' };
     const req = https.request(options, res => {
       let data = '';
       res.on('data', c => data += c);
-      res.on('end', () => { try { resolve(JSON.parse(data)); } catch { reject(new Error('Parse: ' + data)); } });
+      res.on('end', () => {
+        try {
+          const parsed = JSON.parse(data);
+          resolve(parsed.data !== undefined ? parsed.data : parsed);
+        } catch { reject(new Error('Parse error: ' + data)); }
+      });
     });
     req.on('error', reject);
     req.end();
   });
 }
 
-// ── Helpers ──────────────────────────────────────────────────────────────────
-async function getMarkPrice(symbol) {
-  const data = await binancePublic('/premiumIndex', { symbol });
-  return parseFloat(data.markPrice);
+// ── Get mark price ────────────────────────────────────────────────────────────
+async function getMarkPrice() {
+  const data = await kucoinPublic(`/api/v1/mark-price/${SYMBOL}/current`);
+  return parseFloat(data.value);
 }
 
-async function getATR(symbol) {
-  const klines = await binancePublic('/klines', { symbol, interval: '3m', limit: 30 });
-  const trs = klines.map(k => {
-    const h = parseFloat(k[2]), l = parseFloat(k[3]), pc = parseFloat(k[4]);
+// ── Get ATR14 from 3m klines ──────────────────────────────────────────────────
+async function getATR() {
+  const to   = Date.now();
+  const from = to - (30 * 3 * 60 * 1000); // 30 x 3min candles
+  const data = await kucoinPublic(`/api/v1/klines?symbol=${SYMBOL}&granularity=3&from=${from}&to=${to}`);
+  // KuCoin kline format: [time, open, high, low, close, volume]
+  const trs = data.map((k, i) => {
+    const h = parseFloat(k[2]), l = parseFloat(k[3]);
+    const pc = i > 0 ? parseFloat(data[i-1][4]) : l;
     return Math.max(h - l, Math.abs(h - pc), Math.abs(l - pc));
   });
   const period = 14;
@@ -80,198 +110,133 @@ async function getATR(symbol) {
   return atr;
 }
 
-function extractPosition(data, symbol) {
-  if (Array.isArray(data)) return data.find(p => p.symbol === symbol) || null;
-  if (data && data.symbol === symbol) return data;
-  return null;
+// ── Place market order ────────────────────────────────────────────────────────
+async function placeMarketOrder(side, size) {
+  return kucoinRequest('POST', '/api/v1/orders', {
+    clientOid: Date.now().toString(),
+    side,      // 'buy' or 'sell'
+    symbol:    SYMBOL,
+    type:      'market',
+    size,      // number of lots
+    leverage:  LEVERAGE,
+  });
 }
 
-async function cancelAllOrders(symbol) {
+// ── Place limit TP order ──────────────────────────────────────────────────────
+async function placeTPOrder(side, size, price) {
+  const result = await kucoinRequest('POST', '/api/v1/orders', {
+    clientOid:   Date.now().toString(),
+    side,
+    symbol:      SYMBOL,
+    type:        'limit',
+    size,
+    price:       parseFloat(price.toFixed(1)),
+    leverage:    LEVERAGE,
+    reduceOnly:  true,
+    timeInForce: 'GTC',
+  });
+  console.log('TP order placed:', JSON.stringify(result));
+  return result;
+}
+
+// ── Cancel all open orders ────────────────────────────────────────────────────
+async function cancelAllOrders() {
   try {
-    await binanceRequest('DELETE', '/allOpenOrders', { symbol });
+    await kucoinRequest('DELETE', `/api/v1/orders?symbol=${SYMBOL}`);
     console.log('✂️  All open orders cancelled');
   } catch (e) { console.log('Cancel orders (may be none):', e.message); }
 }
 
-async function placeMarketOrder(symbol, side, quantity) {
-  return binanceRequest('POST', '/order', { symbol, side, quantity, type: 'MARKET' });
-}
-
-async function placeMarketClose(symbol, side, quantity) {
-  const closeSide = side === 'BUY' ? 'SELL' : 'BUY';
-  return binanceRequest('POST', '/order', {
-    symbol, side: closeSide, quantity,
-    type: 'MARKET', reduceOnly: 'true',
+// ── Close position at market ──────────────────────────────────────────────────
+async function placeMarketClose(side, size) {
+  const closeSide = side === 'buy' ? 'sell' : 'buy';
+  return kucoinRequest('POST', '/api/v1/orders', {
+    clientOid:  Date.now().toString(),
+    side:       closeSide,
+    symbol:     SYMBOL,
+    type:       'market',
+    size,
+    leverage:   LEVERAGE,
+    reduceOnly: true,
   });
 }
 
-async function placeTPOrder(symbol, side, quantity, price) {
-  const result = await binanceRequest('POST', '/order', {
-    symbol, side, type: 'LIMIT',
-    price: parseFloat(price.toFixed(1)),
-    quantity, reduceOnly: 'true', timeInForce: 'GTC',
-  });
-  console.log('TP order result:', JSON.stringify(result));
-  if (result.code) throw new Error(`TP order failed: ${result.msg}`);
-  return result;
+// ── Get open position ─────────────────────────────────────────────────────────
+async function getPosition() {
+  try {
+    const data = await kucoinRequest('GET', `/api/v1/position?symbol=${SYMBOL}`);
+    return data;
+  } catch (e) { return null; }
 }
 
-// ── Close position (shared by SL monitor + TP poll + manual) ────────────────
+// ── Close position (shared handler) ──────────────────────────────────────────
 async function closePosition(reason, pnl) {
-  if (isClosing) return;   // FIX: prevent double-close race condition
+  if (isClosing) return;
   isClosing = true;
   try {
-    await cancelAllOrders(SYMBOL);
-    if (reason === 'SL' || reason === 'MANUAL') await placeMarketClose(SYMBOL, openPos.side, openPos.qty);
+    await cancelAllOrders();
+    await placeMarketClose(openPos.side, openPos.lots);
     const emoji = reason === 'TP' ? '✅' : '❌';
     trades.unshift({ ...openPos, closedAt: new Date().toISOString(), result: reason, pnl: pnl.toFixed(2) });
     if (trades.length > 50) trades.pop();
     console.log(`Trade closed — ${reason} ${emoji} | PNL: ${reason === 'TP' ? '+' : ''}${pnl.toFixed(2)} USDT`);
     openPos = null;
-    stopSLMonitor();
+    stopMonitor();
   } finally {
     isClosing = false;
   }
 }
 
-// ── SL Monitor ───────────────────────────────────────────────────────────────
-function startSLMonitor() {
+// ── Price monitor — watches TP and SL every 5s ────────────────────────────────
+function startMonitor() {
   if (slMonitorInterval) clearInterval(slMonitorInterval);
   slMonitorInterval = setInterval(async () => {
     if (!openPos || isClosing) return;
     try {
-      const mark = await getMarkPrice(SYMBOL);
-      const { side, sl, tp, entry, qty } = openPos;
+      const mark = await getMarkPrice();
+      const { side, sl, tp, entry, lots } = openPos;
 
-      const tpHit = side === 'BUY' ? mark >= tp : mark <= tp;
-      const slHit = side === 'BUY' ? mark <= sl : mark >= sl;
+      const tpHit = side === 'buy' ? mark >= tp : mark <= tp;
+      const slHit = side === 'buy' ? mark <= sl : mark >= sl;
 
       if (tpHit) {
         console.log(`🎯 TP HIT @ ${mark.toFixed(1)} | level: ${tp.toFixed(1)}`);
-        const pnl = side === 'BUY'
-          ? (tp - entry) * parseFloat(qty) * LEVERAGE
-          : (entry - tp) * parseFloat(qty) * LEVERAGE;
+        const pnl = side === 'buy'
+          ? (tp - entry) * lots * 0.001 * parseFloat(LEVERAGE)
+          : (entry - tp) * lots * 0.001 * parseFloat(LEVERAGE);
         await closePosition('TP', pnl);
       } else if (slHit) {
         console.log(`⛔ SL HIT @ ${mark.toFixed(1)} | level: ${sl.toFixed(1)}`);
-        const pnl = side === 'BUY'
-          ? (sl - entry) * parseFloat(qty) * LEVERAGE
-          : (entry - sl) * parseFloat(qty) * LEVERAGE;
+        const pnl = side === 'buy'
+          ? (sl - entry) * lots * 0.001 * parseFloat(LEVERAGE)
+          : (entry - sl) * lots * 0.001 * parseFloat(LEVERAGE);
         await closePosition('SL', pnl);
       }
-    } catch (e) { console.log('SL monitor error:', e.message); }
+    } catch (e) { console.log('Monitor error:', e.message); }
   }, 5000);
-  console.log('🔍 Price monitor active — watching TP and SL every 5s');
+  console.log('🔍 Price monitor active (TP + SL every 5s)');
 }
 
-function stopSLMonitor() {
+function stopMonitor() {
   if (slMonitorInterval) { clearInterval(slMonitorInterval); slMonitorInterval = null; }
 }
 
-// ── Query order status by orderId ───────────────────────────────────────────
-async function getOrderStatus(symbol, orderId) {
-  return binanceRequest('GET', '/order', { symbol, orderId });
-}
-
-// ── TP Poll — checks TP ORDER status, not positionRisk ──────────────────────
-// This is the correct method: if the TP limit order is FILLED = real win
-// positionRisk can return 0 briefly and cause false positives — order status cannot
-let tpPollActive = false;
-
-function startTPPoll(tpOrderId) {
-  if (tpPollActive) return;
-  tpPollActive = true;
-  console.log(`🎯 TP poll started — watching order ${tpOrderId}`);
-
-  const interval = setInterval(async () => {
-    if (!openPos || isClosing) {
-      clearInterval(interval);
-      tpPollActive = false;
-      return;
-    }
-    try {
-      // If no TP order on Binance (was rejected), fall back to positionRisk
-      if (!tpOrderId) {
-        const data = await binanceRequest('GET', '/positionRisk', { symbol: SYMBOL });
-        const pos  = extractPosition(data, SYMBOL);
-        const size = pos ? Math.abs(parseFloat(pos.positionAmt)) : 0;
-        if (size === 0) {
-          const { tp, entry, qty, side } = openPos;
-          const pnl = side === 'BUY'
-            ? (tp - entry) * parseFloat(qty) * LEVERAGE
-            : (entry - tp) * parseFloat(qty) * LEVERAGE;
-          clearInterval(interval);
-          tpPollActive = false;
-          await closePosition('TP', pnl);
-        }
-        return;
-      }
-
-      // Primary method: check if TP limit order was FILLED
-      const order = await getOrderStatus(SYMBOL, tpOrderId);
-      if (order.status === 'FILLED') {
-        const fillPrice = parseFloat(order.avgPrice);
-        const { entry, qty, side } = openPos;
-        const pnl = side === 'BUY'
-          ? (fillPrice - entry) * parseFloat(qty) * LEVERAGE
-          : (entry - fillPrice) * parseFloat(qty) * LEVERAGE;
-        clearInterval(interval);
-        tpPollActive = false;
-        console.log(`✅ TP order FILLED @ ${fillPrice}`);
-        await closePosition('TP', pnl);
-      } else if (order.status === 'CANCELED' || order.status === 'EXPIRED') {
-        // TP was cancelled (SL hit or manual) — stop polling
-        clearInterval(interval);
-        tpPollActive = false;
-        console.log(`TP order ${order.status} — stopping TP poll`);
-      }
-    } catch (e) { console.log('TP poll error:', e.message); }
-  }, 10000);
-}
-
-// ── Confirm entry filled, return actual fill price ───────────────────────────
-async function confirmEntryFilled(orderId, fallbackPrice, maxWaitMs = 10000) {
-  const start = Date.now();
-  while (Date.now() - start < maxWaitMs) {
-    try {
-      const order = await getOrderStatus(SYMBOL, orderId);
-      if (order.status === 'FILLED' && parseFloat(order.avgPrice) > 0) {
-        const fillPrice = parseFloat(order.avgPrice);
-        console.log(`✅ Entry confirmed FILLED @ ${fillPrice}`);
-        return fillPrice;
-      }
-    } catch (e) { console.log('Entry confirm error:', e.message); }
-    await new Promise(r => setTimeout(r, 1000));
-  }
-  console.log(`⚠️  Entry not confirmed after ${maxWaitMs/1000}s — using mark price ${fallbackPrice}`);
-  return fallbackPrice;
-}
-
-// ── Keep-alive self-ping to prevent Render free tier sleep ───────────────────
-setInterval(() => {
-  const req = https.request({ hostname: 'localhost', port: PORT, path: '/health', method: 'GET' }, () => {});
-  req.on('error', () => {});
-  req.end();
-}, 5 * 60 * 1000);
-
-// ── Startup position check (retries 3x) ──────────────────────────────────────
+// ── Startup position check ────────────────────────────────────────────────────
 async function checkExistingPosition(attempt = 1) {
   try {
-    const data = await binanceRequest('GET', '/positionRisk', { symbol: SYMBOL });
-    const pos  = extractPosition(data, SYMBOL);
-    const size = pos ? parseFloat(pos.positionAmt) : 0;
-    if (Math.abs(size) > 0) {
-      const side  = size > 0 ? 'BUY' : 'SELL';
-      const entry = parseFloat(pos.entryPrice);
-      const atr   = await getATR(SYMBOL);
-      const tp    = side === 'BUY' ? entry + atr * TP_ATR_MULT : entry - atr * TP_ATR_MULT;
-      const sl    = side === 'BUY' ? entry - atr * SL_ATR_MULT : entry + atr * SL_ATR_MULT;
-      openPos = { side, entry, tp, sl, atr, qty: QUANTITY, openedAt: new Date().toISOString() };
-      startSLMonitor();
-      startTPPoll(null); // no TP orderId on restore — falls back to positionRisk
-      console.log(`⚠️  Position restored: ${side} @ ${entry} | TP: ${tp.toFixed(1)} | SL: ${sl.toFixed(1)}`);
+    const pos = await getPosition();
+    if (pos && pos.currentQty && pos.currentQty !== 0) {
+      const side  = pos.currentQty > 0 ? 'buy' : 'sell';
+      const entry = parseFloat(pos.avgEntryPrice);
+      const lots  = Math.abs(pos.currentQty);
+      const atr   = await getATR();
+      const tp    = side === 'buy' ? entry + atr * TP_ATR_MULT : entry - atr * TP_ATR_MULT;
+      const sl    = side === 'buy' ? entry - atr * SL_ATR_MULT : entry + atr * SL_ATR_MULT;
+      openPos = { side, entry, tp, sl, atr, lots, openedAt: new Date().toISOString() };
+      startMonitor();
+      console.log(`⚠️  Position restored: ${side.toUpperCase()} @ ${entry} | TP: ${tp.toFixed(1)} | SL: ${sl.toFixed(1)}`);
     } else {
-      await cancelAllOrders(SYMBOL); // clean up any orphaned orders
+      await cancelAllOrders();
       console.log('✅ No existing position — starting fresh');
     }
   } catch (e) {
@@ -285,13 +250,19 @@ async function checkExistingPosition(attempt = 1) {
   }
 }
 
-// ── Webhook ──────────────────────────────────────────────────────────────────
+// ── Keep-alive ping ───────────────────────────────────────────────────────────
+setInterval(() => {
+  const req = https.request({ hostname: 'localhost', port: PORT, path: '/health', method: 'GET' }, () => {});
+  req.on('error', () => {});
+  req.end();
+}, 5 * 60 * 1000);
+
+// ── Webhook ───────────────────────────────────────────────────────────────────
 app.post('/webhook', async (req, res) => {
   try {
     const { action } = req.body;
     console.log('Webhook:', JSON.stringify(req.body));
 
-    // FIX: double webhook race condition guard
     if (openPos || isEntering) {
       console.log('Already in position or entering — ignoring signal');
       return res.json({ ok: false, reason: 'Already in position' });
@@ -299,35 +270,43 @@ app.post('/webhook', async (req, res) => {
     isEntering = true;
 
     try {
-      const side      = action === 'buy' ? 'BUY' : 'SELL';
-      const closeSide = side === 'BUY' ? 'SELL' : 'BUY';
+      const side      = action === 'buy' ? 'buy' : 'sell';
+      const closeSide = side === 'buy' ? 'sell' : 'buy';
 
-      await binanceRequest('POST', '/leverage', { symbol: SYMBOL, leverage: LEVERAGE });
-
-      const currentPrice = await getMarkPrice(SYMBOL);
-      const atr          = await getATR(SYMBOL);
-      const entryOrder = await placeMarketOrder(SYMBOL, side, QUANTITY);
+      const markPrice  = await getMarkPrice();
+      const atr        = await getATR();
+      const entryOrder = await placeMarketOrder(side, LOTS);
       console.log('Entry order:', JSON.stringify(entryOrder));
 
-      // Confirm entry filled and get real fill price (polls order status)
-      const entryPrice = await confirmEntryFilled(entryOrder.orderId, currentPrice);
+      const entryPrice = markPrice; // use mark price as fill estimate
+      const tp = side === 'buy' ? entryPrice + atr * TP_ATR_MULT : entryPrice - atr * TP_ATR_MULT;
+      const sl = side === 'buy' ? entryPrice - atr * SL_ATR_MULT : entryPrice + atr * SL_ATR_MULT;
 
-      const tp = side === 'BUY' ? entryPrice + atr * TP_ATR_MULT : entryPrice - atr * TP_ATR_MULT;
-      const sl = side === 'BUY' ? entryPrice - atr * SL_ATR_MULT : entryPrice + atr * SL_ATR_MULT;
+      // Wait for position to register then place TP
+      console.log('⏳ Waiting for position to register...');
+      for (let i = 0; i < 15; i++) {
+        await new Promise(r => setTimeout(r, 1000));
+        const pos = await getPosition();
+        if (pos && pos.currentQty && pos.currentQty !== 0) {
+          console.log(`✅ Position confirmed after ${i+1}s`);
+          break;
+        }
+      }
 
-      // DEMO MODE: Skip Binance TP order entirely
-      // Monitor both TP and SL via mark price — avoids all -2022 errors
-      let tpOrderId = null;
-      console.log('📊 Demo mode — TP and SL both monitored by bot (no Binance TP order)');
+      // Place TP limit order
+      try {
+        await placeTPOrder(closeSide, LOTS, tp);
+      } catch (tpErr) {
+        console.error('⚠️  TP order failed — monitor protecting:', tpErr.message);
+      }
 
-      openPos = { side, entry: entryPrice, tp, sl, atr, qty: QUANTITY, openedAt: new Date().toISOString() };
-      startSLMonitor();
-      startTPPoll(tpOrderId);
+      const tpDollar = (atr * TP_ATR_MULT * LOTS * 0.001 * parseFloat(LEVERAGE)).toFixed(2);
+      const slDollar = (atr * SL_ATR_MULT * LOTS * 0.001 * parseFloat(LEVERAGE)).toFixed(2);
 
-      const tpDollar = (atr * TP_ATR_MULT * parseFloat(QUANTITY) * LEVERAGE).toFixed(2);
-      const slDollar = (atr * SL_ATR_MULT * parseFloat(QUANTITY) * LEVERAGE).toFixed(2);
+      openPos = { side, entry: entryPrice, tp, sl, atr, lots: LOTS, openedAt: new Date().toISOString() };
+      startMonitor();
 
-      console.log(`ENTRY ${side} @ ${entryPrice.toFixed(1)} | TP: ${tp.toFixed(1)} (+$${tpDollar}) | SL: ${sl.toFixed(1)} (-$${slDollar}) | ATR: ${atr.toFixed(1)} | Leverage: ${LEVERAGE}x`);
+      console.log(`ENTRY ${side.toUpperCase()} @ ${entryPrice.toFixed(1)} | TP: ${tp.toFixed(1)} (+$${tpDollar}) | SL: ${sl.toFixed(1)} (-$${slDollar}) | ATR: ${atr.toFixed(1)} | Leverage: ${LEVERAGE}x`);
       res.json({ ok: true, side, entry: entryPrice.toFixed(1), tp: tp.toFixed(1), sl: sl.toFixed(1), tpDollar, slDollar });
 
     } finally {
@@ -341,57 +320,50 @@ app.post('/webhook', async (req, res) => {
   }
 });
 
-// ── FIX: Manual close endpoint ───────────────────────────────────────────────
+// ── Manual close ──────────────────────────────────────────────────────────────
 app.post('/close', async (req, res) => {
   if (!openPos) return res.json({ ok: false, reason: 'No open position' });
   try {
-    console.log('🔴 Manual close requested');
-    const mark = await getMarkPrice(SYMBOL);
-    const { side, entry, qty } = openPos;
-    const pnl = side === 'BUY'
-      ? (mark - entry) * parseFloat(qty) * LEVERAGE
-      : (entry - mark) * parseFloat(qty) * LEVERAGE;
+    const mark = await getMarkPrice();
+    const { side, entry, lots } = openPos;
+    const pnl = side === 'buy'
+      ? (mark - entry) * lots * 0.001 * parseFloat(LEVERAGE)
+      : (entry - mark) * lots * 0.001 * parseFloat(LEVERAGE);
     await closePosition('MANUAL', pnl);
     res.json({ ok: true, pnl: pnl.toFixed(2) });
-  } catch (e) {
-    res.status(500).json({ ok: false, error: e.message });
-  }
+  } catch (e) { res.status(500).json({ ok: false, error: e.message }); }
 });
 
-// ── Status & Health ──────────────────────────────────────────────────────────
+// ── Status & Health ───────────────────────────────────────────────────────────
 app.get('/status', (req, res) => {
   res.json({
-    ok: true, testnet: TESTNET, symbol: SYMBOL,
-    quantity: QUANTITY, leverage: LEVERAGE,
+    ok: true, exchange: 'KuCoin Futures', symbol: SYMBOL,
+    lots: LOTS, leverage: LEVERAGE,
     tpMult: TP_ATR_MULT, slMult: SL_ATR_MULT,
     rr: `${TP_ATR_MULT / SL_ATR_MULT}:1`,
-    slMonitorActive: slMonitorInterval !== null,
+    monitorActive: slMonitorInterval !== null,
     isClosing, isEntering,
     openPos, recentTrades: trades.slice(0, 20),
   });
 });
 
 app.get('/health', (req, res) => {
-  res.json({ ok: true, uptime: process.uptime(), testnet: TESTNET, symbol: SYMBOL });
+  res.json({ ok: true, uptime: process.uptime(), exchange: 'KuCoin', symbol: SYMBOL });
 });
 
-// ── Start ────────────────────────────────────────────────────────────────────
-const PORT = process.env.PORT || 3000;
+// ── Start ─────────────────────────────────────────────────────────────────────
 app.listen(PORT, async () => {
-  // FIX: API key check on startup
-  if (!API_KEY || !API_SECRET) {
-    console.error('🚨 MISSING API KEYS — set BINANCE_API_KEY and BINANCE_SECRET_KEY in Render environment');
+  if (!API_KEY || !API_SECRET || !API_PASS) {
+    console.error('🚨 MISSING API KEYS — set KUCOIN_API_KEY, KUCOIN_SECRET_KEY, KUCOIN_PASSPHRASE');
   }
   console.log(`╔══════════════════════════════════════════════╗`);
-  console.log(`║  ATR14 Futures Bot — BOT-SIDE SL MONITOR    ║`);
-  console.log(`║  Mode:     ${TESTNET ? 'TESTNET ✓' : 'LIVE ⚠️ '}                        ║`);
-  console.log(`║  Symbol:   ${SYMBOL.padEnd(12)}              ║`);
-  console.log(`║  Quantity: ${String(QUANTITY).padEnd(12)}              ║`);
-  console.log(`║  Leverage: ${String(LEVERAGE).padEnd(12)}x             ║`);
-  console.log(`║  TP: ${TP_ATR_MULT}x ATR (Binance LIMIT order)         ║`);
-  console.log(`║  SL: ${SL_ATR_MULT}x ATR (bot monitors every 5s)       ║`);
-  console.log(`║  Keep-alive: ping every 5 min               ║`);
+  console.log(`║  ATR14 Futures Bot — KuCoin Edition          ║`);
+  console.log(`║  Exchange:  KuCoin Futures                   ║`);
+  console.log(`║  Symbol:    ${SYMBOL.padEnd(12)}              ║`);
+  console.log(`║  Lots:      ${String(LOTS).padEnd(12)}              ║`);
+  console.log(`║  Leverage:  ${String(LEVERAGE).padEnd(12)}x             ║`);
+  console.log(`║  TP: ${TP_ATR_MULT}x ATR  SL: ${SL_ATR_MULT}x ATR  RR: ${TP_ATR_MULT/SL_ATR_MULT}:1       ║`);
+  console.log(`║  Monitor:   every 5s (TP + SL)               ║`);
   console.log(`╚══════════════════════════════════════════════╝`);
   await checkExistingPosition();
 });
-
