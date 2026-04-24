@@ -159,27 +159,54 @@ function stopSLMonitor() {
   if (slMonitorInterval) { clearInterval(slMonitorInterval); slMonitorInterval = null; }
 }
 
-// ── TP Poll (every 15s, skips first 60s after entry to avoid false positives) ─
-setInterval(async () => {
-  if (!openPos || isClosing) return;
+// ── Wait for Binance to confirm position registered, then start TP poll ─────
+// This replaces the blanket 60s delay — works even if TP hits in <60 seconds
+async function waitForPositionConfirmed(maxWaitMs = 15000) {
+  const start = Date.now();
+  while (Date.now() - start < maxWaitMs) {
+    try {
+      const data = await binanceRequest('GET', '/positionRisk', { symbol: SYMBOL });
+      const pos  = extractPosition(data, SYMBOL);
+      const size = pos ? Math.abs(parseFloat(pos.positionAmt)) : 0;
+      if (size > 0) {
+        console.log(`✅ Position confirmed on Binance (${((Date.now()-start)/1000).toFixed(1)}s)`);
+        return true;
+      }
+    } catch (e) { console.log('Position confirm check error:', e.message); }
+    await new Promise(r => setTimeout(r, 2000)); // check every 2s
+  }
+  console.log('⚠️  Position not confirmed after 15s — proceeding anyway');
+  return false;
+}
 
-  // FIX: Don't poll for first 60 seconds — Binance needs time to register position
-  const secondsOpen = (Date.now() - new Date(openPos.openedAt).getTime()) / 1000;
-  if (secondsOpen < 60) return;
+// ── TP Poll (every 10s, only runs after position confirmed) ──────────────────
+let tpPollActive = false;
 
-  try {
-    const data = await binanceRequest('GET', '/positionRisk', { symbol: SYMBOL });
-    const pos  = extractPosition(data, SYMBOL);
-    const size = pos ? Math.abs(parseFloat(pos.positionAmt)) : 0;
-    if (size === 0) {
-      const { tp, entry, qty, side } = openPos;
-      const pnl = side === 'BUY'
-        ? (tp - entry) * parseFloat(qty) * LEVERAGE
-        : (entry - tp) * parseFloat(qty) * LEVERAGE;
-      await closePosition('TP', pnl);
+function startTPPoll() {
+  if (tpPollActive) return;
+  tpPollActive = true;
+  const interval = setInterval(async () => {
+    if (!openPos || isClosing) {
+      clearInterval(interval);
+      tpPollActive = false;
+      return;
     }
-  } catch (e) { console.log('TP poll error:', e.message); }
-}, 15000);
+    try {
+      const data = await binanceRequest('GET', '/positionRisk', { symbol: SYMBOL });
+      const pos  = extractPosition(data, SYMBOL);
+      const size = pos ? Math.abs(parseFloat(pos.positionAmt)) : 0;
+      if (size === 0) {
+        const { tp, entry, qty, side } = openPos;
+        const pnl = side === 'BUY'
+          ? (tp - entry) * parseFloat(qty) * LEVERAGE
+          : (entry - tp) * parseFloat(qty) * LEVERAGE;
+        clearInterval(interval);
+        tpPollActive = false;
+        await closePosition('TP', pnl);
+      }
+    } catch (e) { console.log('TP poll error:', e.message); }
+  }, 10000);
+}
 
 // ── Keep-alive self-ping to prevent Render free tier sleep ───────────────────
 setInterval(() => {
@@ -202,6 +229,7 @@ async function checkExistingPosition(attempt = 1) {
       const sl    = side === 'BUY' ? entry - atr * SL_ATR_MULT : entry + atr * SL_ATR_MULT;
       openPos = { side, entry, tp, sl, atr, qty: QUANTITY, openedAt: new Date().toISOString() };
       startSLMonitor();
+      startTPPoll();
       console.log(`⚠️  Position restored: ${side} @ ${entry} | TP: ${tp.toFixed(1)} | SL: ${sl.toFixed(1)}`);
     } else {
       await cancelAllOrders(SYMBOL); // clean up any orphaned orders
@@ -268,6 +296,10 @@ app.post('/webhook', async (req, res) => {
 
       openPos = { side, entry: entryPrice, tp, sl, atr, qty: QUANTITY, openedAt: new Date().toISOString() };
       startSLMonitor();
+
+      // FIX: Wait for Binance to confirm position, THEN start TP poll
+      // This prevents false TP detections without missing fast TP hits
+      waitForPositionConfirmed().then(() => startTPPoll());
 
       const tpDollar = (atr * TP_ATR_MULT * parseFloat(QUANTITY) * LEVERAGE).toFixed(2);
       const slDollar = (atr * SL_ATR_MULT * parseFloat(QUANTITY) * LEVERAGE).toFixed(2);
