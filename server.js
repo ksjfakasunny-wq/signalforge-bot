@@ -159,9 +159,14 @@ function stopSLMonitor() {
   if (slMonitorInterval) { clearInterval(slMonitorInterval); slMonitorInterval = null; }
 }
 
-// ── TP Poll (every 10s — FIX: was 30s, too slow) ────────────────────────────
+// ── TP Poll (every 15s, skips first 60s after entry to avoid false positives) ─
 setInterval(async () => {
   if (!openPos || isClosing) return;
+
+  // FIX: Don't poll for first 60 seconds — Binance needs time to register position
+  const secondsOpen = (Date.now() - new Date(openPos.openedAt).getTime()) / 1000;
+  if (secondsOpen < 60) return;
+
   try {
     const data = await binanceRequest('GET', '/positionRisk', { symbol: SYMBOL });
     const pos  = extractPosition(data, SYMBOL);
@@ -174,7 +179,7 @@ setInterval(async () => {
       await closePosition('TP', pnl);
     }
   } catch (e) { console.log('TP poll error:', e.message); }
-}, 10000);
+}, 15000);
 
 // ── Keep-alive self-ping to prevent Render free tier sleep ───────────────────
 setInterval(() => {
