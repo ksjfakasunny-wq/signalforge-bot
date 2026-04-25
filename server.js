@@ -116,8 +116,8 @@ async function getATR() {
   const period = 14;
   let atr = trs.slice(0, period).reduce((a, b) => a + b, 0) / period;
   for (let i = period; i < trs.length; i++) atr = (atr * (period - 1) + trs[i]) / period;
-  // Scale ATR: 1-min ATR × √3 to approximate 3-min ATR
-  return atr * Math.sqrt(3);
+  // 1m timeframe — no scaling needed
+  return atr;
 }
 
 // ── Place market entry order ──────────────────────────────────────────────────
