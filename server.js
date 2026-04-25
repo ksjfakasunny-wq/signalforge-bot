@@ -306,35 +306,39 @@ app.post('/webhook', async (req, res) => {
       const tp = side === 'buy' ? markPrice + atr * TP_ATR_MULT : markPrice - atr * TP_ATR_MULT;
       const sl = side === 'buy' ? markPrice - atr * SL_ATR_MULT : markPrice + atr * SL_ATR_MULT;
 
-      // Store position immediately so SL monitor starts protecting
-      openPos = {
-        side, entry: markPrice, tp, sl, atr,
-        lots: LOTS, openedAt: new Date().toISOString(),
-      };
-      startMonitor();
-
-      // Wait for position to register on KuCoin (up to 15s)
+      // Wait for position to register on KuCoin BEFORE setting openPos
+      // This prevents ghost position / SL monitor firing on non-existent position
       console.log('⏳ Waiting for position to register...');
       let actualEntry = markPrice;
+      let positionConfirmed = false;
+
       for (let i = 0; i < 15; i++) {
         await new Promise(r => setTimeout(r, 1000));
         try {
           const pos = await getPosition();
           if (pos && pos.isOpen === true && pos.currentQty !== 0) {
             actualEntry = parseFloat(pos.avgEntryPrice) || markPrice;
+            positionConfirmed = true;
             console.log(`✅ Position confirmed after ${i+1}s | Fill: ${actualEntry}`);
-            // Update TP/SL with actual fill price
-            openPos.entry = actualEntry;
-            openPos.tp = side === 'buy' ? actualEntry + atr * TP_ATR_MULT : actualEntry - atr * TP_ATR_MULT;
-            openPos.sl = side === 'buy' ? actualEntry - atr * SL_ATR_MULT : actualEntry + atr * SL_ATR_MULT;
             break;
           }
         } catch (e) { console.log('Position check:', e.message); }
       }
 
-      // Place TP limit order using closeOrder=true (no side/size needed per docs)
+      if (!positionConfirmed) {
+        console.error('❌ Position not confirmed after 15s — aborting trade');
+        return res.status(500).json({ ok: false, error: 'Position not confirmed on KuCoin' });
+      }
+
+      // Now safe to set openPos and start monitor
+      const confirmedTp = side === 'buy' ? actualEntry + atr * TP_ATR_MULT : actualEntry - atr * TP_ATR_MULT;
+      const confirmedSl = side === 'buy' ? actualEntry - atr * SL_ATR_MULT : actualEntry + atr * SL_ATR_MULT;
+      openPos = { side, entry: actualEntry, tp: confirmedTp, sl: confirmedSl, atr, lots: LOTS, openedAt: new Date().toISOString() };
+      startMonitor();
+
+      // Place TP limit order
       try {
-        await placeTPOrder(openPos.tp);
+        await placeTPOrder(confirmedTp);
       } catch (tpErr) {
         console.error('⚠️  TP order failed:', tpErr.message);
       }
@@ -411,3 +415,4 @@ app.listen(PORT, async () => {
   console.log(`╚══════════════════════════════════════════════╝`);
   await checkExistingPosition();
 });
+
