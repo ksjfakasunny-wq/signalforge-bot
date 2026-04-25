@@ -10,20 +10,19 @@ const API_KEY     = process.env.KUCOIN_API_KEY    || '';
 const API_SECRET  = process.env.KUCOIN_SECRET_KEY || '';
 const API_PASS    = process.env.KUCOIN_PASSPHRASE || '';
 const SYMBOL      = process.env.SYMBOL      || 'XBTUSDTM';
-const LOTS        = parseInt(process.env.LOTS || '3');
-const LEVERAGE    = parseInt(process.env.LEVERAGE || '3');
+const LOTS        = parseInt(process.env.LOTS || '1');
+const LEVERAGE    = parseInt(process.env.LEVERAGE || '2');
 const TP_ATR_MULT = parseFloat(process.env.TP_ATR_MULT || '3.0');
 const SL_ATR_MULT = parseFloat(process.env.SL_ATR_MULT || '0.5');
 const PORT        = process.env.PORT || 3000;
-
-const BASE_URL = 'api-futures.kucoin.com';
+const BASE_URL    = 'api-futures.kucoin.com';
 
 // ── State ─────────────────────────────────────────────────────────────────────
-let openPos           = null;
-let trades            = [];
-let monitorInterval   = null;
-let isClosing         = false;
-let isEntering        = false;
+let openPos         = null;
+let trades          = [];
+let monitorInterval = null;
+let isClosing       = false;
+let isEntering      = false;
 
 // ── KuCoin signed request ─────────────────────────────────────────────────────
 function kucoinRequest(method, path, body = null) {
@@ -96,17 +95,17 @@ async function getMarkPrice() {
   return parseFloat(data.value);
 }
 
-// ── Get ATR14 using 1-min klines (3-min not available on KuCoin futures) ──────
+// ── Get ATR14 using 3-min klines ──────────────────────────────────────────────
 async function getATR() {
   const to   = Date.now();
-  const from = to - (3 * 60 * 60 * 1000); // 3 hours of 3min candles = 60 candles
-  // KuCoin kline format: [time, open, high, low, close, volume]
+  const from = to - (3 * 60 * 60 * 1000); // 3 hours = ~60 x 3min candles
   const data = await kucoinPublic(
     `/api/v1/kline/query?symbol=${SYMBOL}&granularity=3&from=${from}&to=${to}`
   );
   if (!Array.isArray(data) || data.length === 0) {
-    throw new Error('No kline data: ' + JSON.stringify(data).substring(0, 100));
+    throw new Error('No kline data returned');
   }
+  // KuCoin kline: [time, open, high, low, close, volume]
   const trs = data.map((k, i) => {
     const h  = parseFloat(k[2]);
     const l  = parseFloat(k[3]);
@@ -115,37 +114,38 @@ async function getATR() {
   });
   const period = 14;
   let atr = trs.slice(0, period).reduce((a, b) => a + b, 0) / period;
-  for (let i = period; i < trs.length; i++) atr = (atr * (period - 1) + trs[i]) / period;
-  // 1m timeframe — no scaling needed
+  for (let i = period; i < trs.length; i++) {
+    atr = (atr * (period - 1) + trs[i]) / period;
+  }
   return atr;
 }
 
 // ── Place market entry order ──────────────────────────────────────────────────
-async function placeMarketOrder(side, size) {
+// Per docs: marginMode MUST be specified as CROSS (default is ISOLATED)
+async function placeMarketOrder(side) {
   return kucoinRequest('POST', '/api/v1/orders', {
     clientOid:  Date.now().toString(),
     side,
     symbol:     SYMBOL,
     type:       'market',
-    size,
+    size:       LOTS,
     leverage:   LEVERAGE,
     marginMode: 'CROSS',
   });
 }
 
 // ── Place TP limit order ──────────────────────────────────────────────────────
-async function placeTPOrder(side, size, price) {
+// Per docs: closeOrder=true means side/size/leverage can be omitted
+// System determines them automatically
+async function placeTPOrder(price) {
   const result = await kucoinRequest('POST', '/api/v1/orders', {
     clientOid:   Date.now().toString(),
-    side,
     symbol:      SYMBOL,
     type:        'limit',
-    size,
     price:       price.toFixed(1),
-    leverage:    LEVERAGE,
-    reduceOnly:  true,
-    timeInForce: 'GTC',
+    closeOrder:  true,
     marginMode:  'CROSS',
+    timeInForce: 'GTC',
   });
   console.log('TP order placed:', JSON.stringify(result));
   return result;
@@ -159,16 +159,13 @@ async function cancelAllOrders() {
   } catch (e) { console.log('Cancel orders:', e.message); }
 }
 
-// ── Close position at market using closeOrder flag ────────────────────────────
-async function placeMarketClose(side) {
-  const closeSide = side === 'buy' ? 'sell' : 'buy';
+// ── Close position at market ──────────────────────────────────────────────────
+// Per docs: closeOrder=true with size=0 closes entire position automatically
+async function placeMarketClose() {
   return kucoinRequest('POST', '/api/v1/orders', {
     clientOid:  Date.now().toString(),
-    side:       closeSide,
     symbol:     SYMBOL,
     type:       'market',
-    size:       0,
-    leverage:   LEVERAGE,
     closeOrder: true,
     marginMode: 'CROSS',
   });
@@ -177,19 +174,28 @@ async function placeMarketClose(side) {
 // ── Get open position ─────────────────────────────────────────────────────────
 async function getPosition() {
   try {
-    return await kucoinRequest('GET', `/api/v1/position?symbol=${SYMBOL}`);
-  } catch (e) { return null; }
+    const data = await kucoinRequest('GET', `/api/v1/position?symbol=${SYMBOL}`);
+    return data;
+  } catch (e) {
+    console.log('getPosition error:', e.message);
+    return null;
+  }
 }
 
-// ── Close position (shared) ───────────────────────────────────────────────────
+// ── Close position shared handler ─────────────────────────────────────────────
 async function closePosition(reason, pnl) {
   if (isClosing || !openPos) return;
   isClosing = true;
   try {
     await cancelAllOrders();
-    await placeMarketClose(openPos.side);
+    await placeMarketClose();
     const emoji = reason === 'TP' ? '✅' : reason === 'SL' ? '❌' : '🔴';
-    trades.unshift({ ...openPos, closedAt: new Date().toISOString(), result: reason, pnl: pnl.toFixed(4) });
+    trades.unshift({
+      ...openPos,
+      closedAt: new Date().toISOString(),
+      result: reason,
+      pnl: pnl.toFixed(4),
+    });
     if (trades.length > 50) trades.pop();
     console.log(`Trade closed — ${reason} ${emoji} | PNL: ${reason === 'TP' ? '+' : ''}${pnl.toFixed(4)} USDT`);
     openPos = null;
@@ -201,7 +207,7 @@ async function closePosition(reason, pnl) {
   }
 }
 
-// ── Price monitor — checks TP and SL every 5s ─────────────────────────────────
+// ── Price monitor — checks TP and SL every 10s ────────────────────────────────
 function startMonitor() {
   if (monitorInterval) clearInterval(monitorInterval);
   monitorInterval = setInterval(async () => {
@@ -213,16 +219,16 @@ function startMonitor() {
       const slHit = side === 'buy' ? mark <= sl : mark >= sl;
 
       if (tpHit) {
+        console.log(`🎯 TP HIT @ ${mark.toFixed(1)} | target: ${tp.toFixed(1)}`);
         const pnl = side === 'buy'
           ? (tp - entry) * lots * 0.001 * LEVERAGE
           : (entry - tp) * lots * 0.001 * LEVERAGE;
-        console.log(`🎯 TP HIT @ ${mark.toFixed(1)} | target: ${tp.toFixed(1)}`);
         await closePosition('TP', pnl);
       } else if (slHit) {
+        console.log(`⛔ SL HIT @ ${mark.toFixed(1)} | target: ${sl.toFixed(1)}`);
         const pnl = side === 'buy'
           ? (sl - entry) * lots * 0.001 * LEVERAGE
           : (entry - sl) * lots * 0.001 * LEVERAGE;
-        console.log(`⛔ SL HIT @ ${mark.toFixed(1)} | target: ${sl.toFixed(1)}`);
         await closePosition('SL', pnl);
       }
     } catch (e) { console.log('Monitor error:', e.message); }
@@ -231,7 +237,10 @@ function startMonitor() {
 }
 
 function stopMonitor() {
-  if (monitorInterval) { clearInterval(monitorInterval); monitorInterval = null; }
+  if (monitorInterval) {
+    clearInterval(monitorInterval);
+    monitorInterval = null;
+  }
 }
 
 // ── Keep-alive ping ───────────────────────────────────────────────────────────
@@ -247,10 +256,12 @@ setInterval(() => {
 async function checkExistingPosition(attempt = 1) {
   try {
     const pos = await getPosition();
-    if (pos && pos.isOpen && pos.currentQty !== 0) {
-      const side  = pos.currentQty > 0 ? 'buy' : 'sell';
+    // isOpen and currentQty are the correct fields per KuCoin docs
+    if (pos && pos.isOpen === true && pos.currentQty !== 0) {
+      const qty   = parseInt(pos.currentQty);
+      const side  = qty > 0 ? 'buy' : 'sell';
       const entry = parseFloat(pos.avgEntryPrice);
-      const lots  = Math.abs(parseInt(pos.currentQty));
+      const lots  = Math.abs(qty);
       const atr   = await getATR();
       const tp    = side === 'buy' ? entry + atr * TP_ATR_MULT : entry - atr * TP_ATR_MULT;
       const sl    = side === 'buy' ? entry - atr * SL_ATR_MULT : entry + atr * SL_ATR_MULT;
@@ -285,48 +296,47 @@ app.post('/webhook', async (req, res) => {
     isEntering = true;
 
     try {
-      const side      = action === 'buy' ? 'buy' : 'sell';
-      const closeSide = side === 'buy' ? 'sell' : 'buy';
+      const side = action === 'buy' ? 'buy' : 'sell';
 
       const markPrice  = await getMarkPrice();
       const atr        = await getATR();
-      const entryOrder = await placeMarketOrder(side, LOTS);
+      const entryOrder = await placeMarketOrder(side);
       console.log('Entry order placed:', JSON.stringify(entryOrder));
 
       const tp = side === 'buy' ? markPrice + atr * TP_ATR_MULT : markPrice - atr * TP_ATR_MULT;
       const sl = side === 'buy' ? markPrice - atr * SL_ATR_MULT : markPrice + atr * SL_ATR_MULT;
 
-      openPos = { side, entry: markPrice, tp, sl, atr, lots: LOTS, openedAt: new Date().toISOString() };
+      // Store position immediately so SL monitor starts protecting
+      openPos = {
+        side, entry: markPrice, tp, sl, atr,
+        lots: LOTS, openedAt: new Date().toISOString(),
+      };
       startMonitor();
 
-      // Wait for position to register then place TP
+      // Wait for position to register on KuCoin (up to 15s)
       console.log('⏳ Waiting for position to register...');
+      let actualEntry = markPrice;
       for (let i = 0; i < 15; i++) {
         await new Promise(r => setTimeout(r, 1000));
         try {
           const pos = await getPosition();
-          if (pos && pos.isOpen && pos.currentQty !== 0) {
-            console.log(`✅ Position confirmed after ${i+1}s`);
-            // Update entry with actual fill price
-            openPos.entry = parseFloat(pos.avgEntryPrice) || markPrice;
-            const actualTp = side === 'buy'
-              ? openPos.entry + atr * TP_ATR_MULT
-              : openPos.entry - atr * TP_ATR_MULT;
-            const actualSl = side === 'buy'
-              ? openPos.entry - atr * SL_ATR_MULT
-              : openPos.entry + atr * SL_ATR_MULT;
-            openPos.tp = actualTp;
-            openPos.sl = actualSl;
-
-            // Place TP limit order
-            try {
-              await placeTPOrder(closeSide, LOTS, actualTp);
-            } catch (tpErr) {
-              console.error('⚠️  TP order failed:', tpErr.message);
-            }
+          if (pos && pos.isOpen === true && pos.currentQty !== 0) {
+            actualEntry = parseFloat(pos.avgEntryPrice) || markPrice;
+            console.log(`✅ Position confirmed after ${i+1}s | Fill: ${actualEntry}`);
+            // Update TP/SL with actual fill price
+            openPos.entry = actualEntry;
+            openPos.tp = side === 'buy' ? actualEntry + atr * TP_ATR_MULT : actualEntry - atr * TP_ATR_MULT;
+            openPos.sl = side === 'buy' ? actualEntry - atr * SL_ATR_MULT : actualEntry + atr * SL_ATR_MULT;
             break;
           }
         } catch (e) { console.log('Position check:', e.message); }
+      }
+
+      // Place TP limit order using closeOrder=true (no side/size needed per docs)
+      try {
+        await placeTPOrder(openPos.tp);
+      } catch (tpErr) {
+        console.error('⚠️  TP order failed:', tpErr.message);
       }
 
       const tpDollar = (atr * TP_ATR_MULT * LOTS * 0.001 * LEVERAGE).toFixed(2);
@@ -357,19 +367,27 @@ app.post('/close', async (req, res) => {
       : (entry - mark) * lots * 0.001 * LEVERAGE;
     await closePosition('MANUAL', pnl);
     res.json({ ok: true, pnl: pnl.toFixed(4) });
-  } catch (e) { res.status(500).json({ ok: false, error: e.message }); }
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e.message });
+  }
 });
 
 // ── Status & Health ───────────────────────────────────────────────────────────
 app.get('/status', (req, res) => {
   res.json({
-    ok: true, exchange: 'KuCoin Futures', symbol: SYMBOL,
-    lots: LOTS, leverage: LEVERAGE,
-    tpMult: TP_ATR_MULT, slMult: SL_ATR_MULT,
+    ok: true,
+    exchange: 'KuCoin Futures',
+    symbol: SYMBOL,
+    lots: LOTS,
+    leverage: LEVERAGE,
+    tpMult: TP_ATR_MULT,
+    slMult: SL_ATR_MULT,
     rr: `${TP_ATR_MULT / SL_ATR_MULT}:1`,
     monitorActive: monitorInterval !== null,
-    isClosing, isEntering,
-    openPos, recentTrades: trades.slice(0, 20),
+    isClosing,
+    isEntering,
+    openPos,
+    recentTrades: trades.slice(0, 20),
   });
 });
 
@@ -380,7 +398,7 @@ app.get('/health', (req, res) => {
 // ── Start ─────────────────────────────────────────────────────────────────────
 app.listen(PORT, async () => {
   if (!API_KEY || !API_SECRET || !API_PASS) {
-    console.error('🚨 MISSING API KEYS — set KUCOIN_API_KEY, KUCOIN_SECRET_KEY, KUCOIN_PASSPHRASE in Render');
+    console.error('🚨 MISSING API KEYS — set KUCOIN_API_KEY, KUCOIN_SECRET_KEY, KUCOIN_PASSPHRASE');
   }
   console.log(`╔══════════════════════════════════════════════╗`);
   console.log(`║  ATR14 Futures Bot — KuCoin Edition          ║`);
@@ -389,7 +407,7 @@ app.listen(PORT, async () => {
   console.log(`║  Lots:      ${String(LOTS).padEnd(12)}              ║`);
   console.log(`║  Leverage:  ${String(LEVERAGE).padEnd(12)}x             ║`);
   console.log(`║  TP: ${TP_ATR_MULT}x ATR  SL: ${SL_ATR_MULT}x ATR  RR: ${TP_ATR_MULT/SL_ATR_MULT}:1       ║`);
-  console.log(`║  Monitor:   TP + SL every 5s                 ║`);
+  console.log(`║  Monitor:   TP + SL every 10s                ║`);
   console.log(`╚══════════════════════════════════════════════╝`);
   await checkExistingPosition();
 });
