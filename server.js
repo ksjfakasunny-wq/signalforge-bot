@@ -99,10 +99,10 @@ async function getMarkPrice() {
 // ── Get ATR14 using 1-min klines (3-min not available on KuCoin futures) ──────
 async function getATR() {
   const to   = Date.now();
-  const from = to - (60 * 60 * 1000); // 1 hour of 1min candles = 60 candles
+  const from = to - (3 * 60 * 60 * 1000); // 3 hours of 3min candles = 60 candles
   // KuCoin kline format: [time, open, high, low, close, volume]
   const data = await kucoinPublic(
-    `/api/v1/kline/query?symbol=${SYMBOL}&granularity=1&from=${from}&to=${to}`
+    `/api/v1/kline/query?symbol=${SYMBOL}&granularity=3&from=${from}&to=${to}`
   );
   if (!Array.isArray(data) || data.length === 0) {
     throw new Error('No kline data: ' + JSON.stringify(data).substring(0, 100));
