@@ -12,8 +12,8 @@ const API_PASS    = process.env.KUCOIN_PASSPHRASE || '';
 const SYMBOL      = process.env.SYMBOL      || 'XBTUSDTM';
 const LOTS        = parseInt(process.env.LOTS || '1');
 const LEVERAGE    = parseInt(process.env.LEVERAGE || '2');
-const TP_ATR_MULT = parseFloat(process.env.TP_ATR_MULT || '3.0');
-const SL_ATR_MULT = parseFloat(process.env.SL_ATR_MULT || '0.5');
+const TP_ATR_MULT = parseFloat(process.env.TP_ATR_MULT || '1.0');
+const SL_ATR_MULT = parseFloat(process.env.SL_ATR_MULT || '1.0');
 const PORT        = process.env.PORT || 3000;
 const BASE_URL    = 'api-futures.kucoin.com';
 
@@ -98,9 +98,9 @@ async function getMarkPrice() {
 // ── Get ATR14 using 3-min klines ──────────────────────────────────────────────
 async function getATR() {
   const to   = Date.now();
-  const from = to - (3 * 60 * 60 * 1000); // 3 hours = ~60 x 3min candles
+  const from = to - (5 * 60 * 60 * 1000); // 5 hours = ~60 x 5min candles
   const data = await kucoinPublic(
-    `/api/v1/kline/query?symbol=${SYMBOL}&granularity=3&from=${from}&to=${to}`
+    `/api/v1/kline/query?symbol=${SYMBOL}&granularity=5&from=${from}&to=${to}`
   );
   if (!Array.isArray(data) || data.length === 0) {
     throw new Error('No kline data returned');
@@ -415,4 +415,3 @@ app.listen(PORT, async () => {
   console.log(`╚══════════════════════════════════════════════╝`);
   await checkExistingPosition();
 });
-
