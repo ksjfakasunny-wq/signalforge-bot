@@ -123,12 +123,13 @@ async function getATR() {
 // ── Place market entry order ──────────────────────────────────────────────────
 async function placeMarketOrder(side, size) {
   return kucoinRequest('POST', '/api/v1/orders', {
-    clientOid: Date.now().toString(),
+    clientOid:  Date.now().toString(),
     side,
-    symbol:    SYMBOL,
-    type:      'market',
+    symbol:     SYMBOL,
+    type:       'market',
     size,
-    leverage:  LEVERAGE,
+    leverage:   LEVERAGE,
+    marginMode: 'CROSS',
   });
 }
 
@@ -144,6 +145,7 @@ async function placeTPOrder(side, size, price) {
     leverage:    LEVERAGE,
     reduceOnly:  true,
     timeInForce: 'GTC',
+    marginMode:  'CROSS',
   });
   console.log('TP order placed:', JSON.stringify(result));
   return result;
@@ -167,7 +169,8 @@ async function placeMarketClose(side) {
     type:       'market',
     size:       0,
     leverage:   LEVERAGE,
-    closeOrder: true,  // KuCoin's correct way to close a position
+    closeOrder: true,
+    marginMode: 'CROSS',
   });
 }
 
@@ -223,8 +226,8 @@ function startMonitor() {
         await closePosition('SL', pnl);
       }
     } catch (e) { console.log('Monitor error:', e.message); }
-  }, 5000);
-  console.log('🔍 Price monitor active — TP + SL every 5s');
+  }, 10000);
+  console.log('🔍 Price monitor active — TP + SL every 10s');
 }
 
 function stopMonitor() {
